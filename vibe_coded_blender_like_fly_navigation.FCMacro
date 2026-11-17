@@ -1,0 +1,935 @@
+import math
+import time
+import warnings
+
+import __main__
+import FreeCAD as App
+import FreeCADGui as Gui
+from pivy import coin
+
+try:
+    from PySide6 import QtCore, QtGui, QtWidgets
+except ImportError:
+    from PySide2 import QtCore, QtGui, QtWidgets
+
+# Harmless Python 3.12 + SWIG warning raised by getCameraNode().
+warnings.filterwarnings("ignore", message=".*SwigPyObject.*",
+                        category=DeprecationWarning)
+
+Qt = QtCore.Qt
+QEvent = QtCore.QEvent
+PORTABLE = QtGui.QKeySequence.PortableText
+MODMASK = (Qt.ShiftModifier | Qt.ControlModifier
+           | Qt.AltModifier | Qt.MetaModifier)
+
+PARAM_PATH = "User parameter:BaseApp/Preferences/Mod/FlyNavigation"
+
+CROSS_STYLES = ["Cross", "X", "Circle", "Circle + Cross", "Dot"]
+
+DEFAULTS = {
+    # navigation
+    "sensitivity": 2.5,        # milliradians per pixel
+    "invert_y": False,
+    "auto_speed": True,
+    "speed": 500.0,            # mm/s, used when auto_speed is off
+    "fast_mult": 4.0,          # Shift
+    "slow_mult": 0.25,         # Alt
+    "wheel_step": 1.2,
+    "smoothing": 0.0,          # seconds, 0 = instant
+    # crosshair
+    "crosshair": True,
+    "cross_style": "Cross",
+    "cross_gap": 4,
+    "cross_arm": 8,
+    "cross_radius": 5,         # circle / dot radius
+    "cross_thickness": 1.0,
+    "cross_color": "#000000",
+    "cross_opacity": 1.0,
+    "cross_outline": False,
+    "cross_outline_color": "#ffffff",
+    "cross_outline_width": 1.0,
+    # keybinds
+    "key_start": "Shift+F",
+    "key_settings": "Ctrl+Shift+F",
+}
+
+
+# ---------------------------------------------------------------- key helpers
+
+def norm_seq(text):
+    """Normalize a key sequence string to a single chord in portable form."""
+    text = (text or "").split(", ")[0].strip()
+    if not text:
+        return ""
+    return QtGui.QKeySequence(text, PORTABLE).toString(PORTABLE)
+
+
+def event_key_string(event):
+    """Key event -> portable string like 'Shift+F' ('' for bare modifiers)."""
+    key = event.key()
+    if key in (Qt.Key_Shift, Qt.Key_Control, Qt.Key_Alt, Qt.Key_Meta,
+               Qt.Key_AltGr, Qt.Key_unknown):
+        return ""
+    mods = event.modifiers() & MODMASK
+    try:
+        ks = QtGui.QKeySequence(QtCore.QKeyCombination(mods, Qt.Key(key)))
+    except Exception:
+        ks = QtGui.QKeySequence(int(mods) | int(key))
+    return ks.toString(PORTABLE)
+
+
+# ------------------------------------------------------------------- settings
+
+class Settings:
+    """Settings stored in FreeCAD's user parameters."""
+
+    def __init__(self):
+        self.p = App.ParamGet(PARAM_PATH)
+        self.d = dict(DEFAULTS)
+        self.load()
+
+    def load(self):
+        for k, default in DEFAULTS.items():
+            if isinstance(default, bool):
+                self.d[k] = self.p.GetBool(k, default)
+            elif isinstance(default, int):
+                self.d[k] = self.p.GetInt(k, default)
+            elif isinstance(default, float):
+                self.d[k] = self.p.GetFloat(k, default)
+            else:
+                self.d[k] = self.p.GetString(k, default)
+
+    def save(self):
+        for k, v in self.d.items():
+            if isinstance(v, bool):
+                self.p.SetBool(k, v)
+            elif isinstance(v, int):
+                self.p.SetInt(k, v)
+            elif isinstance(v, float):
+                self.p.SetFloat(k, v)
+            else:
+                self.p.SetString(k, str(v))
+
+    def __getitem__(self, k):
+        return self.d[k]
+
+    def __setitem__(self, k, v):
+        self.d[k] = v
+
+
+# ------------------------------------------------------------------ crosshair
+
+def _color(hexstr, opacity):
+    c = QtGui.QColor(hexstr)
+    if not c.isValid():
+        c = QtGui.QColor(0, 0, 0)
+    c.setAlphaF(max(0.0, min(1.0, float(opacity))))
+    return c
+
+
+def draw_crosshair(p, cx, cy, cfg):
+    """Draw the crosshair centered on (cx, cy). Used by overlay and preview."""
+    style = cfg["cross_style"]
+    g = float(cfg["cross_gap"])
+    a = float(cfg["cross_arm"])
+    r = float(cfg["cross_radius"])
+    th = max(0.5, float(cfg["cross_thickness"]))
+    ow = max(0.0, float(cfg["cross_outline_width"]))
+
+    p.setRenderHint(QtGui.QPainter.Antialiasing, style != "Cross")
+
+    layers = []
+    if cfg["cross_outline"]:
+        layers.append((_color(cfg["cross_outline_color"],
+                              cfg["cross_opacity"]), ow))
+    layers.append((_color(cfg["cross_color"], cfg["cross_opacity"]), 0.0))
+
+    s = math.sqrt(0.5)
+    for color, e in layers:
+        pen = QtGui.QPen(color, th + 2.0 * e)
+        pen.setCapStyle(Qt.FlatCap)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+
+        if style in ("Cross", "X", "Circle + Cross"):
+            if style == "X":
+                dirs = [(-s, -s), (s, -s), (-s, s), (s, s)]
+            else:
+                dirs = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+            d0, d1 = g - e, g + a + e
+            for dx, dy in dirs:
+                p.drawLine(QtCore.QLineF(cx + dx * d0, cy + dy * d0,
+                                         cx + dx * d1, cy + dy * d1))
+
+        if style in ("Circle", "Circle + Cross"):
+            p.drawEllipse(QtCore.QPointF(cx, cy), r, r)
+
+        if style == "Dot":
+            p.setPen(Qt.NoPen)
+            p.setBrush(color)
+            p.drawEllipse(QtCore.QPointF(cx, cy), r + e, r + e)
+
+
+class Crosshair(QtWidgets.QWidget):
+    def __init__(self, parent, cfg):
+        super().__init__(parent)
+        self.cfg = dict(cfg)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WA_NoSystemBackground)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFocusPolicy(Qt.NoFocus)
+
+    def fit(self):
+        self.setGeometry(self.parentWidget().rect())
+        self.raise_()
+
+    def paintEvent(self, event):
+        p = QtGui.QPainter(self)
+        c = self.rect().center()
+        draw_crosshair(p, c.x(), c.y(), self.cfg)
+        p.end()
+
+
+class CrosshairPreview(QtWidgets.QWidget):
+    """Shows the crosshair over a light and a dark background."""
+
+    def __init__(self, get_cfg):
+        super().__init__()
+        self.get_cfg = get_cfg
+        self.setMinimumSize(240, 110)
+
+    def paintEvent(self, event):
+        p = QtGui.QPainter(self)
+        r = self.rect()
+        half = r.width() // 2
+        p.fillRect(0, 0, half, r.height(), QtGui.QColor(205, 205, 205))
+        p.fillRect(half, 0, r.width() - half, r.height(),
+                   QtGui.QColor(55, 55, 60))
+        c = r.center()
+        draw_crosshair(p, c.x(), c.y(), self.get_cfg())
+        p.end()
+
+
+class ColorButton(QtWidgets.QPushButton):
+    changed = QtCore.Signal()
+
+    def __init__(self, hexcolor="#000000"):
+        super().__init__()
+        self._c = hexcolor
+        self.clicked.connect(self._pick)
+        self._paint()
+
+    def color(self):
+        return self._c
+
+    def setColor(self, hexcolor):
+        self._c = hexcolor
+        self._paint()
+
+    def _paint(self):
+        c = QtGui.QColor(self._c)
+        lum = 0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()
+        fg = "#000000" if lum > 140 else "#ffffff"
+        self.setText(self._c.upper())
+        self.setStyleSheet("background-color: %s; color: %s;" % (self._c, fg))
+
+    def _pick(self, *args):
+        c = QtWidgets.QColorDialog.getColor(QtGui.QColor(self._c), self,
+                                            "Choose color")
+        if c.isValid():
+            self._c = c.name()
+            self._paint()
+            self.changed.emit()
+
+
+# ------------------------------------------------------------ settings dialog
+
+class SettingsDialog(QtWidgets.QDialog):
+    def __init__(self, settings, on_apply, parent=None):
+        super().__init__(parent)
+        self.s = settings
+        self.on_apply = on_apply
+        self.setWindowTitle("Fly Navigation Settings")
+        self.setMinimumWidth(440)
+
+        tabs = QtWidgets.QTabWidget()
+        tabs.addTab(self._build_nav_tab(), "Navigation")
+        tabs.addTab(self._build_cross_tab(), "Crosshair")
+        tabs.addTab(self._build_keys_tab(), "Keys")
+
+        box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok
+            | QtWidgets.QDialogButtonBox.Apply
+            | QtWidgets.QDialogButtonBox.Cancel
+            | QtWidgets.QDialogButtonBox.RestoreDefaults)
+        box.accepted.connect(self._ok)
+        box.rejected.connect(self.reject)
+        box.button(QtWidgets.QDialogButtonBox.Apply).clicked.connect(
+            self._apply)
+        box.button(QtWidgets.QDialogButtonBox.RestoreDefaults).clicked.connect(
+            self._defaults)
+
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.addWidget(tabs)
+        lay.addWidget(box)
+
+        self._to_ui(self.s.d)
+
+    # ---- tab builders
+
+    @staticmethod
+    def _dspin(lo, hi, step, decimals, suffix):
+        w = QtWidgets.QDoubleSpinBox()
+        w.setRange(lo, hi)
+        w.setSingleStep(step)
+        w.setDecimals(decimals)
+        w.setSuffix(suffix)
+        return w
+
+    @staticmethod
+    def _ispin(lo, hi, suffix=" px"):
+        w = QtWidgets.QSpinBox()
+        w.setRange(lo, hi)
+        w.setSuffix(suffix)
+        return w
+
+    def _build_nav_tab(self):
+        page = QtWidgets.QWidget()
+        form = QtWidgets.QFormLayout(page)
+
+        self.sens = self._dspin(0.1, 50.0, 0.1, 2, " mrad/px")
+        self.sens.setToolTip("Mouse look sensitivity")
+        form.addRow("Mouse sensitivity", self.sens)
+
+        self.invert = QtWidgets.QCheckBox("Reverse mouse (invert Y)")
+        form.addRow("", self.invert)
+
+        self.auto_speed = QtWidgets.QCheckBox("Auto (based on view distance)")
+        self.auto_speed.toggled.connect(self._update_enabled)
+        form.addRow("Start speed", self.auto_speed)
+
+        self.speed = self._dspin(0.01, 1e6, 10.0, 2, " mm/s")
+        form.addRow("Speed", self.speed)
+
+        self.fast = self._dspin(1.0, 50.0, 0.5, 2, "x")
+        form.addRow("Shift multiplier", self.fast)
+
+        self.slow = self._dspin(0.01, 1.0, 0.05, 2, "x")
+        form.addRow("Alt multiplier", self.slow)
+
+        self.wheel = self._dspin(1.01, 3.0, 0.05, 2, "x")
+        self.wheel.setToolTip("Speed change per mouse wheel notch")
+        form.addRow("Wheel speed step", self.wheel)
+
+        self.smooth = self._dspin(0.0, 2.0, 0.05, 2, " s")
+        self.smooth.setToolTip("Acceleration smoothing. 0 = instant")
+        form.addRow("Smoothing", self.smooth)
+
+        note = QtWidgets.QLabel(
+            "The start speed is used for the first flight. After that, the "
+            "last speed you used (set with the mouse wheel) is remembered "
+            "for the rest of the session. Pressing Apply or OK resets it.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: gray;")
+        form.addRow(note)
+        return page
+
+    def _build_cross_tab(self):
+        page = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(page)
+
+        self.preview = CrosshairPreview(self._collect)
+        lay.addWidget(self.preview)
+
+        form = QtWidgets.QFormLayout()
+        lay.addLayout(form)
+
+        self.cross = QtWidgets.QCheckBox("Show crosshair")
+        self.cross.toggled.connect(self._update_enabled)
+        form.addRow("Crosshair", self.cross)
+
+        self.style = QtWidgets.QComboBox()
+        self.style.addItems(CROSS_STYLES)
+        self.style.currentIndexChanged.connect(self._update_enabled)
+        form.addRow("Style", self.style)
+
+        self.gap = self._ispin(0, 100)
+        form.addRow("Gap", self.gap)
+
+        self.arm = self._ispin(1, 300)
+        form.addRow("Line length", self.arm)
+
+        self.radius = self._ispin(1, 100)
+        form.addRow("Circle / dot radius", self.radius)
+
+        self.thick = self._dspin(0.5, 10.0, 0.5, 1, " px")
+        form.addRow("Line thickness", self.thick)
+
+        self.color = ColorButton()
+        form.addRow("Color", self.color)
+
+        self.opacity = self._dspin(0.05, 1.0, 0.05, 2, "")
+        form.addRow("Opacity", self.opacity)
+
+        self.outline = QtWidgets.QCheckBox("Draw outline (helps on dark views)")
+        self.outline.toggled.connect(self._update_enabled)
+        form.addRow("Outline", self.outline)
+
+        self.outline_color = ColorButton("#ffffff")
+        form.addRow("Outline color", self.outline_color)
+
+        self.outline_w = self._dspin(0.5, 10.0, 0.5, 1, " px")
+        form.addRow("Outline width", self.outline_w)
+
+        for w in (self.cross, self.outline):
+            w.toggled.connect(self.preview.update)
+        self.style.currentIndexChanged.connect(self.preview.update)
+        for w in (self.gap, self.arm, self.radius, self.thick,
+                  self.opacity, self.outline_w):
+            w.valueChanged.connect(self.preview.update)
+        for w in (self.color, self.outline_color):
+            w.changed.connect(self.preview.update)
+        return page
+
+    def _build_keys_tab(self):
+        page = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(page)
+        form = QtWidgets.QFormLayout()
+        lay.addLayout(form)
+
+        self.key_start = QtWidgets.QKeySequenceEdit()
+        self.key_settings = QtWidgets.QKeySequenceEdit()
+        for edit, name, row_label in (
+                (self.key_start, "key_start", "Start / stop fly mode"),
+                (self.key_settings, "key_settings", "Open settings")):
+            edit.keySequenceChanged.connect(
+                lambda *a, e=edit: self._trim_key(e))
+            reset = QtWidgets.QPushButton("Reset")
+            reset.clicked.connect(
+                lambda *a, e=edit, n=name: self._set_key(e, DEFAULTS[n]))
+            row = QtWidgets.QHBoxLayout()
+            row.addWidget(edit, 1)
+            row.addWidget(reset)
+            form.addRow(row_label, row)
+
+        self.hint = QtWidgets.QLabel()
+        self.hint.setWordWrap(True)
+        self.hint.setStyleSheet("color: gray;")
+        lay.addWidget(self.hint)
+
+        note = QtWidgets.QLabel(
+            "Click a field and press the key combination you want. "
+            "The start key only works while the mouse is over the 3D view. "
+            "Pressing it again while flying stops fly mode and keeps the "
+            "new view. Use a modifier (Shift, Ctrl, Alt) to avoid clashing "
+            "with FreeCAD shortcuts.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: gray;")
+        lay.addWidget(note)
+        lay.addStretch(1)
+        return page
+
+    # ---- key editing
+
+    @staticmethod
+    def _edit_text(edit):
+        return norm_seq(edit.keySequence().toString(PORTABLE))
+
+    def _set_key(self, edit, text):
+        edit.blockSignals(True)
+        edit.setKeySequence(QtGui.QKeySequence(text, PORTABLE))
+        edit.blockSignals(False)
+        self._update_hint()
+
+    def _trim_key(self, edit):
+        # Keep only the first chord of whatever was recorded.
+        self._set_key(edit, self._edit_text(edit))
+
+    def _update_hint(self):
+        self.hint.setText(
+            "Hover the 3D view and press %s to fly (press it again to "
+            "stop). Press %s to open this window."
+            % (self._edit_text(self.key_start) or "(none)",
+               self._edit_text(self.key_settings) or "(none)"))
+
+    # ---- enable / disable
+
+    def _update_enabled(self, *args):
+        self.speed.setEnabled(not self.auto_speed.isChecked())
+
+        on = self.cross.isChecked()
+        style = self.style.currentText()
+        has_lines = style in ("Cross", "X", "Circle + Cross")
+        has_round = style in ("Circle", "Circle + Cross", "Dot")
+        self.style.setEnabled(on)
+        self.gap.setEnabled(on and has_lines)
+        self.arm.setEnabled(on and has_lines)
+        self.radius.setEnabled(on and has_round)
+        self.thick.setEnabled(on and style != "Dot")
+        self.color.setEnabled(on)
+        self.opacity.setEnabled(on)
+        self.outline.setEnabled(on)
+        self.outline_color.setEnabled(on and self.outline.isChecked())
+        self.outline_w.setEnabled(on and self.outline.isChecked())
+
+    # ---- data <-> UI
+
+    def _to_ui(self, d):
+        self.sens.setValue(d["sensitivity"])
+        self.invert.setChecked(d["invert_y"])
+        self.auto_speed.setChecked(d["auto_speed"])
+        self.speed.setValue(d["speed"])
+        self.fast.setValue(d["fast_mult"])
+        self.slow.setValue(d["slow_mult"])
+        self.wheel.setValue(d["wheel_step"])
+        self.smooth.setValue(d["smoothing"])
+
+        self.cross.setChecked(d["crosshair"])
+        i = self.style.findText(d["cross_style"])
+        self.style.setCurrentIndex(i if i >= 0 else 0)
+        self.gap.setValue(d["cross_gap"])
+        self.arm.setValue(d["cross_arm"])
+        self.radius.setValue(d["cross_radius"])
+        self.thick.setValue(d["cross_thickness"])
+        self.color.setColor(d["cross_color"])
+        self.opacity.setValue(d["cross_opacity"])
+        self.outline.setChecked(d["cross_outline"])
+        self.outline_color.setColor(d["cross_outline_color"])
+        self.outline_w.setValue(d["cross_outline_width"])
+
+        self._set_key(self.key_start, d["key_start"])
+        self._set_key(self.key_settings, d["key_settings"])
+
+        self._update_enabled()
+        self.preview.update()
+
+    def _collect(self):
+        d = dict(self.s.d)
+        d.update({
+            "sensitivity": self.sens.value(),
+            "invert_y": self.invert.isChecked(),
+            "auto_speed": self.auto_speed.isChecked(),
+            "speed": self.speed.value(),
+            "fast_mult": self.fast.value(),
+            "slow_mult": self.slow.value(),
+            "wheel_step": self.wheel.value(),
+            "smoothing": self.smooth.value(),
+            "crosshair": self.cross.isChecked(),
+            "cross_style": self.style.currentText(),
+            "cross_gap": self.gap.value(),
+            "cross_arm": self.arm.value(),
+            "cross_radius": self.radius.value(),
+            "cross_thickness": self.thick.value(),
+            "cross_color": self.color.color(),
+            "cross_opacity": self.opacity.value(),
+            "cross_outline": self.outline.isChecked(),
+            "cross_outline_color": self.outline_color.color(),
+            "cross_outline_width": self.outline_w.value(),
+            "key_start": self._edit_text(self.key_start),
+            "key_settings": self._edit_text(self.key_settings),
+        })
+        return d
+
+    def _defaults(self, *args):
+        self._to_ui(DEFAULTS)
+
+    def _apply(self, *args):
+        d = self._collect()
+        if not d["key_start"] or not d["key_settings"]:
+            QtWidgets.QMessageBox.warning(
+                self, "Fly Navigation",
+                "Both keybinds need a key combination.")
+            return False
+        if d["key_start"] == d["key_settings"]:
+            QtWidgets.QMessageBox.warning(
+                self, "Fly Navigation",
+                "The start and settings keybinds must be different.")
+            return False
+        self.s.d.update(d)
+        self.s.save()
+        self.on_apply()
+        return True
+
+    def _ok(self):
+        if self._apply():
+            self.accept()
+
+
+# ----------------------------------------------------------------- navigation
+
+class FlyNavigation(QtCore.QObject):
+    """Blender-style fly mode for the FreeCAD 3D view (Z-up).
+
+    Start key (default Shift+F, mouse over 3D view); press again to stop
+    Settings key (default Ctrl+Shift+F)
+    Mouse                : look
+    W/S/A/D              : forward/back/left/right
+    E / Q                : up / down
+    Mouse wheel          : change speed (remembered for the session)
+    Shift / Alt          : faster / slower
+    LMB, Enter, Space    : confirm (keep new view)
+    RMB, Esc             : cancel (restore old view)
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.settings = Settings()
+        self.dialog = None
+        self.active = False
+        self.keys = set()
+        self.speed = 100.0
+        self.session_speed = None   # last speed used this session
+        self.vel = [0.0, 0.0, 0.0]
+        self.view = None
+        self.camera = None
+        self.saved = None
+        self.saved_cursor = None
+        self.cross = None
+        self.last_time = 0.0
+        self.yaw = 0.0
+        self.pitch = 0.0
+        self.pos = [0.0, 0.0, 0.0]
+        self.key_start = ""
+        self.key_settings = ""
+        self._refresh_keys()
+
+        self.timer = QtCore.QTimer(self)
+        self.timer.setInterval(8)
+        self.timer.timeout.connect(self.update)
+
+        QtWidgets.QApplication.instance().installEventFilter(self)
+        print("Fly navigation loaded. Hover the 3D view and press %s "
+              "(again to stop). %s opens settings."
+              % (self.key_start, self.key_settings))
+
+    # ---------- helpers ----------
+
+    def _refresh_keys(self):
+        self.key_start = norm_seq(self.settings["key_start"])
+        self.key_settings = norm_seq(self.settings["key_settings"])
+
+    def _viewport(self):
+        mdi = Gui.getMainWindow().findChild(QtWidgets.QMdiArea)
+        sub = mdi.activeSubWindow() if mdi else None
+        return sub.widget() if sub else None
+
+    def _mouse_over_view(self):
+        vp = self._viewport()
+        if vp is None:
+            return False
+        return vp.rect().contains(vp.mapFromGlobal(QtGui.QCursor.pos()))
+
+    def _main_focused(self):
+        return QtWidgets.QApplication.activeWindow() is Gui.getMainWindow()
+
+    def _typing(self, ks):
+        """True if this key would be typed text (so we should not hijack it)."""
+        if "Ctrl+" in ks or "Alt+" in ks or "Meta+" in ks:
+            return False
+        w = QtWidgets.QApplication.focusWidget()
+        return isinstance(w, (QtWidgets.QLineEdit, QtWidgets.QTextEdit,
+                              QtWidgets.QPlainTextEdit,
+                              QtWidgets.QAbstractSpinBox))
+
+    def _center(self):
+        vp = self._viewport()
+        return vp.mapToGlobal(vp.rect().center())
+
+    def _snapshot(self):
+        cam = self.view.getCameraNode()
+        s = {
+            "type": self.view.getCameraType(),
+            "pos": cam.position.getValue().getValue(),
+            "rot": cam.orientation.getValue().getValue(),
+            "focal": cam.focalDistance.getValue(),
+        }
+        if hasattr(cam, "height"):
+            s["height"] = cam.height.getValue()
+        return s
+
+    def _restore_camera(self):
+        s = self.saved
+        if self.view.getCameraType() != s["type"]:
+            self.view.setCameraType(s["type"])
+        cam = self.view.getCameraNode()
+        cam.position.setValue(coin.SbVec3f(*s["pos"]))
+        cam.orientation.setValue(coin.SbRotation(*s["rot"]))
+        cam.focalDistance.setValue(s["focal"])
+        if "height" in s and hasattr(cam, "height"):
+            cam.height.setValue(s["height"])
+
+    # ---------- settings dialog ----------
+
+    def open_settings(self):
+        if self.active:
+            return
+        if self.dialog is not None:
+            self.dialog.raise_()
+            self.dialog.activateWindow()
+            return
+        self.dialog = SettingsDialog(self.settings, self._settings_applied,
+                                     Gui.getMainWindow())
+        self.dialog.setAttribute(Qt.WA_DeleteOnClose)
+        self.dialog.destroyed.connect(self._dialog_closed)
+        self.dialog.show()
+
+    def _dialog_closed(self, *args):
+        self.dialog = None
+
+    def _settings_applied(self):
+        self._refresh_keys()
+        # Applying settings resets the remembered speed so the configured
+        # start speed takes effect on the next flight.
+        self.session_speed = None
+        print("Fly navigation: start = %s, settings = %s"
+              % (self.key_start, self.key_settings))
+
+    # ---------- start / stop ----------
+
+    def start(self):
+        try:
+            self.view = Gui.activeDocument().activeView()
+            self.saved = self._snapshot()
+        except Exception:
+            print("Fly: no active 3D view.")
+            return
+
+        if self.view.getCameraType() != "Perspective":
+            self.view.setCameraType("Perspective")
+        self.camera = self.view.getCameraNode()
+
+        p = self.camera.position.getValue().getValue()
+        self.pos = [float(p[0]), float(p[1]), float(p[2])]
+        d = self.camera.orientation.getValue().multVec(
+            coin.SbVec3f(0, 0, -1)).getValue()
+        self.yaw = math.atan2(d[1], d[0])
+        self.pitch = math.asin(max(-1.0, min(1.0, d[2])))
+
+        if self.session_speed is not None:
+            self.speed = self.session_speed
+        elif self.settings["auto_speed"]:
+            self.speed = max(self.saved["focal"], 1.0) * 0.5
+        else:
+            self.speed = self.settings["speed"]
+
+        self.keys.clear()
+        self.vel = [0.0, 0.0, 0.0]
+        self.saved_cursor = QtGui.QCursor.pos()
+        QtGui.QCursor.setPos(self._center())
+        QtWidgets.QApplication.setOverrideCursor(Qt.BlankCursor)
+
+        if self.settings["crosshair"]:
+            vp = self._viewport()
+            self.cross = Crosshair(vp, self.settings.d)
+            self.cross.fit()
+            self.cross.show()
+
+        self.active = True
+        self.last_time = time.perf_counter()
+        self.timer.start()
+        self._status()
+
+    def stop(self, confirm=True):
+        if not self.active:
+            return
+        self.active = False
+        self.timer.stop()
+        self.keys.clear()
+        # Remember the speed for the next flight this session.
+        self.session_speed = self.speed
+        if self.cross is not None:
+            self.cross.hide()
+            self.cross.deleteLater()
+            self.cross = None
+        QtWidgets.QApplication.restoreOverrideCursor()
+        if self.saved_cursor is not None:
+            QtGui.QCursor.setPos(self.saved_cursor)
+        if not confirm:
+            try:
+                self._restore_camera()
+            except Exception:
+                pass
+        Gui.getMainWindow().statusBar().clearMessage()
+
+    def close(self):
+        self.stop(confirm=True)
+        QtWidgets.QApplication.instance().removeEventFilter(self)
+        self.timer.stop()
+        if self.dialog is not None:
+            self.dialog.close()
+
+    def _status(self):
+        Gui.getMainWindow().statusBar().showMessage(
+            "Fly: WASD move, E/Q up/down, wheel speed (%.0f), "
+            "Shift fast, Alt slow, LMB/Enter/%s confirm, RMB/Esc cancel"
+            % (self.speed, self.key_start))
+
+    # ---------- per-frame update ----------
+
+    def update(self):
+        if not self.active:
+            return
+        now = time.perf_counter()
+        dt = min(now - self.last_time, 0.1)
+        self.last_time = now
+
+        mods = QtWidgets.QApplication.keyboardModifiers()
+        speed = self.speed
+        if mods & Qt.ShiftModifier:
+            speed *= self.settings["fast_mult"]
+        if mods & Qt.AltModifier:
+            speed *= self.settings["slow_mult"]
+
+        cp = math.cos(self.pitch)
+        look = (math.cos(self.yaw) * cp, math.sin(self.yaw) * cp,
+                math.sin(self.pitch))
+        right = (math.sin(self.yaw), -math.cos(self.yaw), 0.0)
+
+        move = [0.0, 0.0, 0.0]
+
+        def add(vec, k):
+            for i in range(3):
+                move[i] += vec[i] * k
+
+        if Qt.Key_W in self.keys: add(look, 1)
+        if Qt.Key_S in self.keys: add(look, -1)
+        if Qt.Key_D in self.keys: add(right, 1)
+        if Qt.Key_A in self.keys: add(right, -1)
+        if Qt.Key_E in self.keys: move[2] += 1
+        if Qt.Key_Q in self.keys: move[2] -= 1
+
+        length = math.sqrt(sum(v * v for v in move))
+        if length:
+            target = [m / length * speed for m in move]
+        else:
+            target = [0.0, 0.0, 0.0]
+
+        tau = self.settings["smoothing"]
+        if tau > 0.0:
+            a = 1.0 - math.exp(-dt / tau)
+            for i in range(3):
+                self.vel[i] += (target[i] - self.vel[i]) * a
+        else:
+            self.vel = target
+
+        for i in range(3):
+            self.pos[i] += self.vel[i] * dt
+
+        try:
+            self.camera.position.setValue(coin.SbVec3f(*self.pos))
+            tgt = coin.SbVec3f(self.pos[0] + look[0],
+                               self.pos[1] + look[1],
+                               self.pos[2] + look[2])
+            self.camera.pointAt(tgt, coin.SbVec3f(0, 0, 1))
+        except Exception:
+            self.stop(confirm=True)
+
+    # ---------- event filter ----------
+
+    def eventFilter(self, obj, event):
+        try:
+            return self._filter(obj, event)
+        except Exception as e:
+            print("Fly error:", e)
+            self.stop(confirm=True)
+            return False
+
+    def _filter(self, obj, event):
+        t = event.type()
+
+        if not self.active:
+            if t in (QEvent.ShortcutOverride, QEvent.KeyPress):
+                if not self._main_focused():
+                    return False
+                ks = event_key_string(event)
+                if not ks or self._typing(ks):
+                    return False
+
+                if ks == self.key_start and self._mouse_over_view():
+                    if t == QEvent.KeyPress and not event.isAutoRepeat():
+                        self.start()
+                    elif t == QEvent.ShortcutOverride:
+                        event.accept()
+                    return True
+
+                if ks == self.key_settings:
+                    if t == QEvent.KeyPress and not event.isAutoRepeat():
+                        self.open_settings()
+                    elif t == QEvent.ShortcutOverride:
+                        event.accept()
+                    return True
+            return False
+
+        # ---- active: swallow input so FreeCAD's own navigation stays out ----
+        if t == QEvent.WindowDeactivate:
+            self.stop(confirm=True)
+            return False
+
+        if t == QEvent.ShortcutOverride:
+            event.accept()
+            return True
+
+        if t == QEvent.KeyPress:
+            key = event.key()
+            # Pressing the start key again stops fly mode (keeps the view).
+            if event_key_string(event) == self.key_start:
+                if not event.isAutoRepeat():
+                    self.stop(confirm=True)
+                return True
+            if key == Qt.Key_Escape:
+                self.stop(confirm=False)
+            elif key in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
+                self.stop(confirm=True)
+            elif not event.isAutoRepeat():
+                self.keys.add(key)
+            return True
+
+        if t == QEvent.KeyRelease:
+            if not event.isAutoRepeat():
+                self.keys.discard(event.key())
+            return True
+
+        if t == QEvent.MouseMove:
+            center = self._center()
+            p = QtGui.QCursor.pos()
+            dx, dy = p.x() - center.x(), p.y() - center.y()
+            if dx or dy:
+                sens = self.settings["sensitivity"] * 0.001
+                sign = -1.0 if self.settings["invert_y"] else 1.0
+                self.yaw -= dx * sens
+                self.pitch -= dy * sens * sign
+                lim = math.radians(89.0)
+                self.pitch = max(-lim, min(lim, self.pitch))
+                QtGui.QCursor.setPos(center)
+            return True
+
+        if t == QEvent.MouseButtonPress:
+            if event.button() == Qt.LeftButton:
+                self.stop(confirm=True)
+            elif event.button() == Qt.RightButton:
+                self.stop(confirm=False)
+            return True
+
+        if t in (QEvent.MouseButtonRelease, QEvent.MouseButtonDblClick,
+                 QEvent.ContextMenu):
+            return True
+
+        if t == QEvent.Wheel:
+            steps = event.angleDelta().y() / 120.0
+            self.speed = max(0.01,
+                             self.speed * (self.settings["wheel_step"] ** steps))
+            self._status()
+            return True
+
+        return False
+
+
+# Clean up a previous instance if the macro is re-run.
+_old = getattr(__main__, "_freecad_fly", None)
+if _old is not None:
+    try:
+        _old.close()
+    except Exception:
+        pass
+
+__main__._freecad_fly = FlyNavigation()
